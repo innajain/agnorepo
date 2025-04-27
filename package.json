@@ -1,5 +1,6 @@
 {
   "name": "agnorepo",
+  "version": "1.0.1",
   "bin": {
     "agnorepo": "dist/index.js"
   },
