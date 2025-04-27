@@ -6,15 +6,24 @@ import { execSync } from 'child_process'
 import inquirer from 'inquirer'
 
 // Types
-type Deps = { apps: string[]; packages: string[] }
+type PackageDependency = { name: string; grpc: boolean }
+type Deps = { apps: string[]; packages: PackageDependency[] }
 type Repo = { name: string; deps: Deps }
 type ReposWithDeps = { apps: Repo[]; packages: Repo[] }
 type Repos = { apps: string[]; packages: string[] }
 
 // Schema validation
+const PackageDependencySchema = z.union([
+  z.string(),
+  z.object({
+    name: z.string(),
+    grpc: z.boolean().default(false),
+  }),
+])
+
 const DepsSchema = z.object({
   apps: z.array(z.string()).optional(),
-  packages: z.array(z.string()).optional(),
+  packages: z.array(PackageDependencySchema).optional(),
 })
 
 // Functions for dependency management
@@ -27,9 +36,19 @@ function read_deps(repo_path: string): Deps {
   if (parsedDeps === undefined) return { apps: [], packages: [] }
 
   const validatedDeps = DepsSchema.parse(parsedDeps)
+
+  // For packages, convert both string and object formats to consistent PackageDependency objects
   return {
     apps: validatedDeps.apps || [],
-    packages: validatedDeps.packages || [],
+    packages: (validatedDeps.packages || []).map((dep) => {
+      if (typeof dep === 'string') {
+        return { name: dep, grpc: false }
+      } else if (dep.name) {
+        return { name: dep.name, grpc: dep.grpc ?? false }
+      } else {
+        throw new Error('Invalid package dependency format')
+      }
+    }),
   }
 }
 
@@ -75,7 +94,7 @@ function check_circular_deps(repos_with_deps: ReposWithDeps): boolean {
     visited.add(repo.name)
     stack.add(repo.name)
 
-    const all_deps = [...repo.deps.apps, ...repo.deps.packages]
+    const all_deps = [...repo.deps.apps, ...repo.deps.packages.map((d) => d.name)]
     for (const dep_name of all_deps) {
       const dep = all_repos.find((r) => r.name === dep_name)
       if (dep && visit(dep)) return true
@@ -131,8 +150,8 @@ function process_all_deps(repos: ReposWithDeps, is_link: boolean) {
       console.log(`Processing ${repo.name}...`)
 
       for (const pkg of repo.deps.packages) {
-        const src_path = path.join('packages', pkg)
-        const target_path = path.join(type, repo.name, 'repo', 'packages', pkg, 'contents')
+        const src_path = path.join('packages', pkg.name)
+        const target_path = path.join(type, repo.name, 'repo', 'packages', pkg.name, 'contents')
         process_dep(src_path, target_path, is_link)
       }
 
@@ -174,20 +193,29 @@ function create_grpc_client(repo_path: string, dep_path: string) {
 }
 
 function create_all_grpc_clients(repos: ReposWithDeps) {
-  console.log('Generating all gRPC clients...')
+  console.log('Generating gRPC clients...')
 
   for (const type of ['apps', 'packages']) {
     for (const repo of repos[type as keyof ReposWithDeps]) {
-      for (const dep_type of ['packages', 'apps']) {
-        for (const dep of repo.deps[dep_type as keyof Deps]) {
-          const dep_path = path.join(dep_type, dep)
+      // Apps always get gRPC clients
+      for (const app_name of repo.deps.apps) {
+        const dep_path = path.join('apps', app_name)
+        console.log(`Generating gRPC client for ${repo.name} -> ${dep_path} (app)`)
+        create_grpc_client(path.join(type, repo.name), dep_path)
+      }
+
+      // Only generate for packages with grpc: true
+      for (const pkg of repo.deps.packages) {
+        if (pkg.grpc) {
+          const dep_path = path.join('packages', pkg.name)
+          console.log(`Generating gRPC client for ${repo.name} -> ${dep_path} (package with grpc: true)`)
           create_grpc_client(path.join(type, repo.name), dep_path)
         }
       }
     }
   }
 
-  console.log('✅ All gRPC clients generated successfully')
+  console.log('✅ gRPC clients generated successfully')
 }
 
 // Create a new app or package
@@ -205,8 +233,12 @@ function create_new_repo(type: 'app' | 'package', name: string) {
   // Create directory structure and files
   fs.mkdirSync(path.join(repo_path, 'protos'), { recursive: true })
 
-  // deps.yaml
-  fs.writeFileSync(path.join(repo_path, 'deps.yaml'), 'apps: []\npackages: []\n')
+  // deps.yaml with updated format
+  if (type === 'app') {
+    fs.writeFileSync(path.join(repo_path, 'deps.yaml'), 'apps:\n  # - app-name\n' + 'packages:\n  # - name: package-name\n  #   grpc: true\n')
+  } else {
+    fs.writeFileSync(path.join(repo_path, 'deps.yaml'), 'apps:\n  # - app-name\n' + 'packages:\n  # - name: package-name\n  #   grpc: true\n')
+  }
 
   fs.writeFileSync(path.join(repo_path, 'protos', 'index.proto'), '// Define your proto files here\n')
 
