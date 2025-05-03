@@ -60,7 +60,7 @@ function get_repos(): Repos {
   // Validate structure
   for (const app of apps) {
     ;['protos/index.proto', 'gen-grpc-client.sh'].forEach((file) => {
-      if (!fs.existsSync(path.join('apps', app, file))) throw new Error(`${file} not found in ${path.join('apps', app)}`)
+      // if (!fs.existsSync(path.join('apps', app, file))) throw new Error(`${file} not found in ${path.join('apps', app)}`)
     })
   }
 
@@ -75,6 +75,7 @@ function get_repos(): Repos {
 
 function get_repos_with_deps(): ReposWithDeps {
   const repos = get_repos()
+
   return {
     apps: repos.apps.map((app) => ({ name: app, deps: read_deps(path.join('apps', app)) })),
     packages: repos.packages.map((pkg) => ({ name: pkg, deps: read_deps(path.join('packages', pkg)) })),
@@ -150,14 +151,19 @@ function process_all_deps(repos: ReposWithDeps, is_link: boolean) {
       console.log(`Processing ${repo.name}...`)
 
       for (const pkg of repo.deps.packages) {
-        const src_path = path.join('packages', pkg.name)
-        const target_path = path.join(type, repo.name, 'repo', 'packages', pkg.name, 'contents')
+        let src_path = path.join('packages', pkg.name)
+        let target_path = path.join(type, repo.name, 'repo', type, pkg.name, 'contents')
         process_dep(src_path, target_path, is_link)
+        if (pkg.grpc) {
+          src_path = path.join('packages', pkg.name, 'protos')
+          target_path = path.join(type, repo.name, 'repo', type, pkg.name, 'protos')
+          process_dep(src_path, target_path, is_link)
+        }
       }
 
       for (const app of repo.deps.apps) {
-        const src_path = path.join('apps', app)
-        const target_path = path.join(type, repo.name, 'repo', 'apps', app, 'contents')
+        const src_path = path.join(type, app, 'protos')
+        const target_path = path.join(type, repo.name, 'repo', type, app, 'protos')
         process_dep(src_path, target_path, is_link)
       }
     }
@@ -166,17 +172,15 @@ function process_all_deps(repos: ReposWithDeps, is_link: boolean) {
   console.log(`✅ All dependencies ${is_link ? 'linked' : 'built'} successfully`)
 }
 
-// Generate gRPC clients
-function create_grpc_client(repo_path: string, dep_path: string) {
-  if (!fs.existsSync(path.join(dep_path, 'protos', 'index.proto'))) throw new Error(`index.proto not found in ${dep_path}/protos`)
-
-  const client_dir = path.join(repo_path, 'repo', dep_path, 'client')
-  fs.mkdirSync(client_dir, { recursive: true })
-  fs.cpSync(path.join(dep_path, 'protos'), path.join(client_dir, 'protos'), { recursive: true })
-
-  const protos_path = path.join('repo', dep_path, 'client', 'protos')
+// Generate gRPC stubs
+function create_grpc_client_stub(repo_path: string, dep_path: string) {
+  const protos_path = path.join(repo_path, 'repo', dep_path, 'protos')
   const proto_file_path = path.join(protos_path, 'index.proto')
-  const output_path = path.join('repo', dep_path, 'client')
+
+  if (!fs.existsSync(proto_file_path)) throw new Error(`index.proto not found in ${dep_path}`)
+
+  const output_path = path.join(repo_path, 'repo', dep_path, 'stub')
+  fs.mkdirSync(output_path, { recursive: true })
 
   try {
     execSync(
@@ -184,38 +188,64 @@ function create_grpc_client(repo_path: string, dep_path: string) {
       PROTO_FILE_PATH="${proto_file_path}" \
       PROTOS_PATH="${protos_path}" \
       OUTPUT_PATH="${output_path}" \
-      sh ./gen-grpc-client.sh`,
+      sh ./gen-grpc-stubs.sh`,
       { stdio: 'inherit' }
     )
   } catch (error) {
-    console.error(`Error generating gRPC client for ${repo_path} from ${dep_path}:`, error)
+    console.error(`Error generating gRPC stub for ${repo_path} from ${dep_path}:`, error)
   }
 }
 
-function create_all_grpc_clients(repos: ReposWithDeps) {
-  console.log('Generating gRPC clients...')
+function create_grpc_server_stub(repo_path: string) {
+  const protos_path = path.join(repo_path, 'protos')
+  const proto_file_path = path.join(protos_path, 'index.proto')
+
+  if (!fs.existsSync(proto_file_path)) throw new Error(`index.proto not found in ${repo_path}`)
+
+  const output_path = path.join(repo_path, 'generated', 'stub')
+  fs.mkdirSync(output_path, { recursive: true })
+
+  try {
+    execSync(
+      `cd ${repo_path} && \
+      PROTO_FILE_PATH="${path.resolve(proto_file_path)}" \
+      PROTOS_PATH="${path.resolve(protos_path)}" \
+      OUTPUT_PATH="${path.resolve(output_path)}" \
+      sh ./gen-grpc-stubs.sh`,
+      { stdio: 'inherit' }
+    )
+  } catch (error) {
+    console.error(`Error generating gRPC server stub for ${repo_path}:`, error)
+  }
+}
+
+function create_all_grpc_stubs(repos: ReposWithDeps) {
+  console.log('Generating gRPC stubs...')
 
   for (const type of ['apps', 'packages']) {
     for (const repo of repos[type as keyof ReposWithDeps]) {
-      // Apps always get gRPC clients
+      if (fs.existsSync(path.join(type, repo.name, 'protos', 'index.proto')) && fs.existsSync(path.join(type, repo.name, 'gen-grpc-stubs.sh'))) {
+        create_grpc_server_stub(path.join(type, repo.name))
+      }
+      // Apps always get gRPC stubs
       for (const app_name of repo.deps.apps) {
         const dep_path = path.join('apps', app_name)
-        console.log(`Generating gRPC client for ${repo.name} -> ${dep_path} (app)`)
-        create_grpc_client(path.join(type, repo.name), dep_path)
+        console.log(`Generating gRPC stub for ${repo.name} -> ${dep_path} (app)`)
+        create_grpc_client_stub(path.join(type, repo.name), dep_path)
       }
 
       // Only generate for packages with grpc: true
       for (const pkg of repo.deps.packages) {
         if (pkg.grpc) {
           const dep_path = path.join('packages', pkg.name)
-          console.log(`Generating gRPC client for ${repo.name} -> ${dep_path} (package with grpc: true)`)
-          create_grpc_client(path.join(type, repo.name), dep_path)
+          console.log(`Generating gRPC stub for ${repo.name} -> ${dep_path} (package with grpc: true)`)
+          create_grpc_client_stub(path.join(type, repo.name), dep_path)
         }
       }
     }
   }
 
-  console.log('✅ gRPC clients generated successfully')
+  console.log('✅ gRPC stubs generated successfully')
 }
 
 // Create a new app or package
@@ -259,19 +289,28 @@ const commands = {
       console.error('❌ Circular dependencies detected!')
       return
     }
+
     process_all_deps(repos, true)
-    create_all_grpc_clients(repos)
     await show_menu()
   },
 
-  build: async () => {
+  grpc: async () => {
+    const repos = get_repos_with_deps()
+    if (check_circular_deps(repos)) {
+      console.error('❌ Circular dependencies detected!')
+      return
+    }
+    create_all_grpc_stubs(repos)
+    await show_menu()
+  },
+
+  clone: async () => {
     const repos = get_repos_with_deps()
     if (check_circular_deps(repos)) {
       console.error('❌ Circular dependencies detected!')
       return
     }
     process_all_deps(repos, false)
-    create_all_grpc_clients(repos)
     await show_menu()
   },
 
@@ -316,9 +355,10 @@ async function show_menu() {
       message: 'What would you like to do?',
       choices: [
         { name: 'Link dependencies (development mode)', value: 'link' },
-        { name: 'Build dependencies (deployment mode)', value: 'build' },
-        { name: 'Create new app', value: 'create_app' },
-        { name: 'Create new package', value: 'create_package' },
+        { name: 'Generate gRPC stubs', value: 'grpc' },
+        { name: 'Clone dependencies (production mode)', value: 'clone' },
+        { name: 'Create new template app', value: 'create_app' },
+        { name: 'Create new template package', value: 'create_package' },
         { name: 'Exit', value: 'exit' },
       ],
     },
